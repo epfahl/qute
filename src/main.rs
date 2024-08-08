@@ -11,7 +11,7 @@ struct EventMessage {
     time: Time,
 }
 
-/// The `EventMessageType` is one of three possible values:
+/// The _event message type_ is one of three possible values:
 /// - `Arrive`: Signals the arrival of an item at the queue.
 /// - `Serve`: Calls the next buffered item to be served.
 /// - `Exit`: Signals the exit of an item from the queue.
@@ -80,6 +80,7 @@ impl EventMessageQueue {
 
 /// The system state, which includes the time, buffer and server counts, and
 /// static server capacity and duration.
+#[derive(Debug)]
 struct State {
     time: Time,
     buffer_count: u32,
@@ -139,6 +140,57 @@ impl State {
     }
 }
 
+/// An _event_ is data that represents a declarative statement about something
+/// that happened.
+///
+/// There can be a one-to-one corresponds between an event message and an
+/// event, but, in general, multiple events can follow the successful
+/// hanlding of a single event message.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Event {
+    event_type: EventType,
+    time: Time,
+}
+
+/// The _event types_ defines here reflect the operations on the `State`.
+///
+/// While `EventType` can mirror each value of `EventMessageType`
+/// (e.g., `EventMessageType::Arive` -> `EventType::Arrived`), event types
+/// can be as granular as is needed for logging and analytical purposes.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum EventType {
+    IncBuffer,
+    DecBuffer,
+    IncServer,
+    DecServer,
+}
+
+/// The event log is essentially a wrapper around a vector of events. This is
+/// implemented as a struct with a single `contents` field to make it easier
+/// to add new features later.
+#[derive(Debug)]
+struct EventLog {
+    contents: Vec<Event>,
+    size: u32,
+}
+
+impl EventLog {
+    /// Create an empty log.
+    fn new() -> Self {
+        Self {
+            contents: vec![],
+            size: 0,
+        }
+    }
+
+    /// Add a new event to the log.
+    fn push(&mut self, event: Event) -> &mut Self {
+        self.contents.push(event);
+        self.size += 1;
+        self
+    }
+}
+
 /// Step the simulation forward by handling the next event message.
 ///
 /// Note: I'm not totally sure why lifetimes are needed here, but I had to
@@ -146,12 +198,14 @@ impl State {
 fn step<'a>(
     emq: &'a mut EventMessageQueue,
     state: &'a mut State,
-) -> Option<(&'a mut EventMessageQueue, &'a mut State)> {
+    log: &'a mut EventLog,
+) -> Option<(&'a mut EventMessageQueue, &'a mut State, &'a mut EventLog)> {
     if let Some((event_message, emq)) = emq.pop() {
-        let (new_event_messages, state) = handle_message(event_message, state);
+        let (state, event_messages, events) = handle_message(event_message, state);
         let state = state.set_time(event_message.time);
-        let emq = new_event_messages.iter().fold(emq, |acc, &e| acc.push(e));
-        Some((emq, state))
+        let emq = event_messages.iter().fold(emq, |acc, &em| acc.push(em));
+        let log = events.iter().fold(log, |acc, &e| acc.push(e));
+        Some((emq, state, log))
     } else {
         None
     }
@@ -162,34 +216,55 @@ fn step<'a>(
 fn handle_message(
     event_message: EventMessage,
     state: &mut State,
-) -> (Vec<EventMessage>, &mut State) {
+) -> (&mut State, Vec<EventMessage>, Vec<Event>) {
     match event_message.event_message_type {
         EventMessageType::Arrive => (
+            state.inc_buffer(),
             vec![EventMessage {
                 event_message_type: EventMessageType::Serve,
                 time: event_message.time,
             }],
-            state.inc_buffer(),
+            vec![Event {
+                event_type: EventType::IncBuffer,
+                time: event_message.time,
+            }],
         ),
         EventMessageType::Serve => {
             if state.can_serve() {
+                // Setting this here to avoid a borrow checker complaint
+                let server_duration = state.server_duration;
+
                 (
+                    state.dec_buffer().inc_server(),
                     vec![EventMessage {
                         event_message_type: EventMessageType::Exit,
-                        time: Time(event_message.time.0 + state.server_duration),
+                        time: Time(event_message.time.0 + server_duration),
                     }],
-                    state.dec_buffer().inc_server(),
+                    vec![
+                        Event {
+                            event_type: EventType::DecBuffer,
+                            time: event_message.time,
+                        },
+                        Event {
+                            event_type: EventType::IncServer,
+                            time: event_message.time,
+                        },
+                    ],
                 )
             } else {
-                (vec![], state)
+                (state, vec![], vec![])
             }
         }
         EventMessageType::Exit => (
+            state.dec_server(),
             vec![EventMessage {
                 event_message_type: EventMessageType::Serve,
                 time: event_message.time,
             }],
-            state.dec_server(),
+            vec![Event {
+                event_type: EventType::DecServer,
+                time: event_message.time,
+            }],
         ),
     }
 }
@@ -210,14 +285,22 @@ fn main() {
     let emq = &mut EventMessageQueue::new();
     let emq = event_messages.iter().fold(emq, |acc, &em| acc.push(em));
 
+    // Create an initially empty event log
+    let log = &mut EventLog::new();
+
     // Loop on step until there are no event messages left
     println!("\n\n");
     println!("{0: >10} {1: >10} {2: >10}", "Time", "Buffer", "Server");
-    while let Some((_emq, state)) = step(emq, state) {
+    while let Some((_emq, state, _log)) = step(emq, state, log) {
         println!(
             "{0: >10} {1: >10} {2: >10}",
             state.time.0, state.buffer_count, state.server_count
         );
+    }
+
+    println!("\n\n");
+    for e in log.contents.iter() {
+        println!("{:?}", e);
     }
 }
 
@@ -288,11 +371,13 @@ mod tests {
         let emq = &mut EventMessageQueue::new();
         let state = &mut State::new(1, 10);
         let emq = emq.push(em);
+        let log = &mut EventLog::new();
 
-        if let Some((emq, state)) = step(emq, state) {
+        if let Some((emq, state, log)) = step(emq, state, log) {
             assert_eq!(1, state.buffer_count);
             if let Some(next_message) = emq.peek() {
                 assert_eq!(EventMessageType::Serve, next_message.event_message_type);
+                assert_eq!(1, log.size);
             }
         }
     }
