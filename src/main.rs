@@ -299,9 +299,7 @@ fn main() {
     }
 
     println!("\n\n");
-    for e in log.contents.iter() {
-        println!("{:?}", e);
-    }
+    log.contents.iter().for_each(|e| println!("{:?}", e));
 }
 
 // TESTS
