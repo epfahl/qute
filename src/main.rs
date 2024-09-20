@@ -83,13 +83,137 @@ impl QueueState {
     }
 }
 
-/// An _event message_ is data that represents a statement about a future
-/// event. For our purposes, an event message is completely specified by
-/// a _type_ and a _time_.
+// /// An _event message_ is data that represents a statement about a future
+// /// event. For our purposes, an event message is completely specified by
+// /// a _type_ and a _time_.
+// #[derive(Debug, Clone, Copy, PartialEq)]
+// struct EventMessage {
+//     event_message_type: EventMessageType,
+//     time: Time,
+// }
+
+/// Trait that defines a `handle` to be implemented for each specific message
+/// type. The interpretation is that an event message is defined as a type that
+/// implements the `Handler` trait.
+///
+/// It might make more sense to just call this `EventMessage`.
+///
+/// For `Debug` impl, see https://stackoverflow.com/questions/76983569/how-to-use-debug-with-a-trait-object
+use core::fmt::Debug;
+trait Handler<'a>: Debug {
+    fn handle(
+        &'a self,
+        queue_state: &'a mut QueueState,
+    ) -> (&mut QueueState, Vec<Box<dyn Handler>>, Vec<Event>);
+
+    fn get_time(&self) -> Time;
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
-struct EventMessage {
-    event_message_type: EventMessageType,
+struct Arrive {
     time: Time,
+}
+
+impl<'a> Handler<'a> for Arrive {
+    fn handle(
+        &'a self,
+        queue_state: &'a mut QueueState,
+    ) -> (&mut QueueState, Vec<Box<dyn Handler>>, Vec<Event>) {
+        let time = self.get_time();
+        if queue_state.can_buffer() {
+            // If an item can be added to the buffer, increment the buffer
+            // and create an event message to call for the next item to be
+            // served.
+            (
+                queue_state.inc_buffer(),
+                vec![Box::new(CallToServe { time: time })],
+                vec![Event {
+                    event_type: EventType::BufferIncremented,
+                    time: time,
+                }],
+            )
+        } else {
+            // If the newly arrived item can't be added to the buffer, the
+            // state is unchanged and there are no new messages. Items that
+            // can't be buffered are effectively discarded.
+            (queue_state, vec![], vec![])
+        }
+    }
+
+    fn get_time(&self) -> Time {
+        self.time
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct CallToServe {
+    time: Time,
+}
+
+impl<'a> Handler<'a> for CallToServe {
+    fn handle(
+        &'a self,
+        queue_state: &'a mut QueueState,
+    ) -> (&mut QueueState, Vec<Box<dyn Handler>>, Vec<Event>) {
+        let time = self.get_time();
+        if queue_state.can_serve() {
+            // Getting this value here to avoid a borrow checker complaint
+            let server_duration = queue_state.server_duration;
+
+            // If an item can be served, decrement the buffer, increment
+            // the server, and create an exit event message.
+            (
+                queue_state.dec_buffer().inc_server(),
+                vec![Box::new(Exit {
+                    time: Time(time.0 + server_duration),
+                })],
+                vec![
+                    Event {
+                        event_type: EventType::BufferDecremented,
+                        time: time,
+                    },
+                    Event {
+                        event_type: EventType::ServerIncremented,
+                        time: time,
+                    },
+                ],
+            )
+        } else {
+            // If an item can't be served, the state is unchanged and there
+            // are no new messages.
+            (queue_state, vec![], vec![])
+        }
+    }
+
+    fn get_time(&self) -> Time {
+        self.time
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Exit {
+    time: Time,
+}
+
+impl<'a> Handler<'a> for Exit {
+    fn handle(
+        &'a self,
+        queue_state: &'a mut QueueState,
+    ) -> (&mut QueueState, Vec<Box<dyn Handler>>, Vec<Event>) {
+        let time = self.get_time();
+        (
+            queue_state.dec_server(),
+            vec![Box::new(CallToServe { time: time })],
+            vec![Event {
+                event_type: EventType::ServerDecremented,
+                time: time,
+            }],
+        )
+    }
+
+    fn get_time(&self) -> Time {
+        self.time
+    }
 }
 
 /// The _event message type_ is one of three possible values:
@@ -105,8 +229,8 @@ enum EventMessageType {
 
 /// A priority queue that holds event messages in order of event time.
 #[derive(Debug)]
-struct EventMessageQueue {
-    messages: Vec<EventMessage>,
+struct EventMessageQueue<'a> {
+    messages: Vec<Box<dyn Handler<'a>>>,
     size: u32,
 }
 
@@ -115,7 +239,7 @@ struct EventMessageQueue {
 ///
 /// Note: This implementation sorts on every push and is thus extremely
 /// inefficient.
-impl EventMessageQueue {
+impl<'a> EventMessageQueue<'a> {
     /// Create an empty message queue.
     fn new() -> Self {
         Self {
@@ -125,15 +249,15 @@ impl EventMessageQueue {
     }
 
     /// Push a new item onto the message queue.
-    fn push(&mut self, message: EventMessage) -> &mut Self {
+    fn push(&mut self, message: Box<dyn Handler<'a>>) -> &mut Self {
         self.messages.push(message);
-        self.messages.sort_by_key(|e| Reverse(e.time));
+        self.messages.sort_by_key(|e| Reverse(e.get_time()));
         self.size += 1;
         self
     }
 
     /// Pop the item at the head of the message queue.
-    fn pop(&mut self) -> Option<(EventMessage, &mut Self)> {
+    fn pop(&mut self) -> Option<(Box<dyn Handler<'a>>, &mut Self)> {
         if let Some(e) = self.messages.pop() {
             self.size -= 1;
             Some((e, self))
@@ -199,17 +323,17 @@ impl EventLog {
 /// Note: I'm not totally sure why lifetimes are needed here, but I had to
 /// appease the compiler.
 fn step<'a>(
-    emq: &'a mut EventMessageQueue,
+    emq: &'a mut EventMessageQueue<'a>,
     queue_state: &'a mut QueueState,
     event_log: &'a mut EventLog,
 ) -> Option<(
-    &'a mut EventMessageQueue,
+    &'a mut EventMessageQueue<'a>,
     &'a mut QueueState,
     &'a mut EventLog,
 )> {
     if let Some((event_message, emq)) = emq.pop() {
-        let (queue_state, event_messages, events) = handle_message(event_message, queue_state);
-        let queue_state = queue_state.set_time(event_message.time);
+        let (queue_state, event_messages, events) = event_message.handle(queue_state);
+        let queue_state = queue_state.set_time(event_message.get_time());
         let emq = event_messages.iter().fold(emq, |acc, &em| acc.push(em));
         let event_log = events.iter().fold(event_log, |acc, &e| acc.push(e));
         Some((emq, queue_state, event_log))
@@ -218,79 +342,79 @@ fn step<'a>(
     }
 }
 
-/// Handle the event message by updating the state and creating new followup
-/// event messages.
-fn handle_message(
-    event_message: EventMessage,
-    queue_state: &mut QueueState,
-) -> (&mut QueueState, Vec<EventMessage>, Vec<Event>) {
-    match event_message.event_message_type {
-        EventMessageType::Arrive => {
-            if queue_state.can_buffer() {
-                // If an item can be added to the buffer, increment the buffer
-                // and create an event message to call for the next item to be
-                // served.
-                (
-                    queue_state.inc_buffer(),
-                    vec![EventMessage {
-                        event_message_type: EventMessageType::CallToServe,
-                        time: event_message.time,
-                    }],
-                    vec![Event {
-                        event_type: EventType::BufferIncremented,
-                        time: event_message.time,
-                    }],
-                )
-            } else {
-                // If the newly arrived item can't be added to the buffer, the
-                // state is unchanged and there are no new messages. Items that
-                // can't be buffered are effectively discarded.
-                (queue_state, vec![], vec![])
-            }
-        }
-        EventMessageType::CallToServe => {
-            if queue_state.can_serve() {
-                // Getting this value here to avoid a borrow checker complaint
-                let server_duration = queue_state.server_duration;
+// /// Handle the event message by updating the state and creating new followup
+// /// event messages.
+// fn handle_message(
+//     event_message: EventMessage,
+//     queue_state: &mut QueueState,
+// ) -> (&mut QueueState, Vec<EventMessage>, Vec<Event>) {
+//     match event_message.event_message_type {
+//         EventMessageType::Arrive => {
+//             if queue_state.can_buffer() {
+//                 // If an item can be added to the buffer, increment the buffer
+//                 // and create an event message to call for the next item to be
+//                 // served.
+//                 (
+//                     queue_state.inc_buffer(),
+//                     vec![EventMessage {
+//                         event_message_type: EventMessageType::CallToServe,
+//                         time: event_message.time,
+//                     }],
+//                     vec![Event {
+//                         event_type: EventType::BufferIncremented,
+//                         time: event_message.time,
+//                     }],
+//                 )
+//             } else {
+//                 // If the newly arrived item can't be added to the buffer, the
+//                 // state is unchanged and there are no new messages. Items that
+//                 // can't be buffered are effectively discarded.
+//                 (queue_state, vec![], vec![])
+//             }
+//         }
+//         EventMessageType::CallToServe => {
+//             if queue_state.can_serve() {
+//                 // Getting this value here to avoid a borrow checker complaint
+//                 let server_duration = queue_state.server_duration;
 
-                // If an item can be served, decrement the buffer, increment
-                // the server, and create an exit event message.
-                (
-                    queue_state.dec_buffer().inc_server(),
-                    vec![EventMessage {
-                        event_message_type: EventMessageType::Exit,
-                        time: Time(event_message.time.0 + server_duration),
-                    }],
-                    vec![
-                        Event {
-                            event_type: EventType::BufferDecremented,
-                            time: event_message.time,
-                        },
-                        Event {
-                            event_type: EventType::ServerIncremented,
-                            time: event_message.time,
-                        },
-                    ],
-                )
-            } else {
-                // If an item can't be served, the state is unchanged and there
-                // are no new messages.
-                (queue_state, vec![], vec![])
-            }
-        }
-        EventMessageType::Exit => (
-            queue_state.dec_server(),
-            vec![EventMessage {
-                event_message_type: EventMessageType::CallToServe,
-                time: event_message.time,
-            }],
-            vec![Event {
-                event_type: EventType::ServerDecremented,
-                time: event_message.time,
-            }],
-        ),
-    }
-}
+//                 // If an item can be served, decrement the buffer, increment
+//                 // the server, and create an exit event message.
+//                 (
+//                     queue_state.dec_buffer().inc_server(),
+//                     vec![EventMessage {
+//                         event_message_type: EventMessageType::Exit,
+//                         time: Time(event_message.time.0 + server_duration),
+//                     }],
+//                     vec![
+//                         Event {
+//                             event_type: EventType::BufferDecremented,
+//                             time: event_message.time,
+//                         },
+//                         Event {
+//                             event_type: EventType::ServerIncremented,
+//                             time: event_message.time,
+//                         },
+//                     ],
+//                 )
+//             } else {
+//                 // If an item can't be served, the state is unchanged and there
+//                 // are no new messages.
+//                 (queue_state, vec![], vec![])
+//             }
+//         }
+//         EventMessageType::Exit => (
+//             queue_state.dec_server(),
+//             vec![EventMessage {
+//                 event_message_type: EventMessageType::CallToServe,
+//                 time: event_message.time,
+//             }],
+//             vec![Event {
+//                 event_type: EventType::ServerDecremented,
+//                 time: event_message.time,
+//             }],
+//         ),
+//     }
+// }
 
 fn main() {
     // Create an initial queue state.
